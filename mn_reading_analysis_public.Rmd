@@ -1,0 +1,973 @@
+---
+title: "Minnesota Reading Analysis: Public Code File"
+author: "Matt Berg-Wall"
+date: "`r Sys.Date()`"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+library(readxl)
+library(dplyr)
+```
+
+```{r chunk_1}
+#import and read most updated file containing demographic and achievement variables of 908 schools
+mn_reading <- read_xlsx("data/Copy_MCA_Reading_2025_Merged_Only.xlsx")
+
+dim(mn_reading)
+names(mn_reading)
+head(mn_reading)
+```
+
+
+```{r clean, message=FALSE, warning=FALSE}
+#identify charter schools, create charter flag from District Type.
+#filter out the 6 NA from the Percent_Proficient, which is dependent variable.
+library(dplyr)
+
+mn_clean <- mn_reading %>%
+  mutate(
+    Per_Proficient = as.numeric(trimws(as.character(Per_Proficient))),
+    District_Type  = trimws(as.character(`District Type`)),
+    is_charter     = ifelse(District_Type == "7", 1, 0)
+  )
+
+sum(is.na(mn_clean$Per_Proficient))
+
+mn_analysis <- mn_clean %>%
+  filter(!is.na(Per_Proficient))
+
+dim(mn_analysis)
+table(mn_analysis$District_Type, useNA = "ifany")
+table(mn_analysis$is_charter)
+```
+
+```{r make_datasets}
+#create a dataset with all elementary schools and another dataset with only traditional
+#excluding charters
+mn_all <- mn_analysis
+mn_trad <- mn_analysis %>% filter(is_charter == 0)
+
+dim(mn_all)
+dim(mn_trad)
+
+```
+
+
+```{r prelim_checks}
+d <- mn_trad  # start with traditional; later repeat with mn_all
+
+# structure + missingness
+str(d)
+sort(colSums(is.na(d)), decreasing = TRUE)
+
+# outcome and key predictors
+summary(d$Per_Proficient)
+table(d$Single_Elem_Dist, useNA="ifany")
+
+summary(d$Total_Enroll)
+summary(d$Per_FRPL)
+summary(d$Per_ELL)
+summary(d$Per_SpEd)
+summary(d$Per_Stu_of_Colr)
+```
+
+```{r chunk_3}
+table(mn_trad$n_elem_schools_in_district, useNA="ifany")
+summary(mn_trad$n_elem_schools_in_district)
+```
+```{r missingness_diagnosis}
+library(dplyr)
+
+d <- mn_trad  # start with traditional; later we can repeat for mn_all
+
+# 1) Missingness counts + percent
+miss_counts <- colSums(is.na(d))
+miss_perc <- round(100 * miss_counts / nrow(d), 2)
+miss_summary <- data.frame(variable = names(miss_counts),
+                           n_missing = as.integer(miss_counts),
+                           pct_missing = as.numeric(miss_perc)) %>%
+  arrange(desc(n_missing))
+miss_summary
+
+# 2) Add missingness flags for the 3 vars of interest
+d2 <- d %>%
+  mutate(
+    FRPL_miss = is.na(Per_FRPL),
+    ELL_miss  = is.na(Per_ELL),
+    SpEd_miss = is.na(Per_SpEd),
+    any_miss  = FRPL_miss | ELL_miss | SpEd_miss
+  )
+
+# 3) How many rows have missingness?
+c(
+  n_rows = nrow(d2),
+  n_FRPL_miss = sum(d2$FRPL_miss),
+  n_ELL_miss  = sum(d2$ELL_miss),
+  n_SpEd_miss = sum(d2$SpEd_miss),
+  n_any_miss  = sum(d2$any_miss)
+)
+
+# 4) Is missingness related to Single_Elem_Dist?
+tab_FRPL <- table(d2$Single_Elem_Dist, d2$FRPL_miss)
+tab_ELL  <- table(d2$Single_Elem_Dist, d2$ELL_miss)
+tab_SpEd <- table(d2$Single_Elem_Dist, d2$SpEd_miss)
+tab_any  <- table(d2$Single_Elem_Dist, d2$any_miss)
+
+tab_FRPL
+prop.table(tab_FRPL, margin = 1)
+
+tab_ELL
+prop.table(tab_ELL, margin = 1)
+
+tab_SpEd
+prop.table(tab_SpEd, margin = 1)
+
+tab_any
+prop.table(tab_any, margin = 1)
+
+# 5) Are missing rows different on key numeric variables?
+miss_compare <- d2 %>%
+  group_by(any_miss) %>%
+  summarise(
+    n = n(),
+    mean_prof = mean(Per_Proficient, na.rm = TRUE),
+    mean_enroll = mean(Total_Enroll, na.rm = TRUE),
+    mean_tested = mean(`Total Tested`, na.rm = TRUE),
+    mean_valid = mean(`Count Valid Scores MCA`, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+miss_compare
+```
+
+```{r district_mismatch_check}
+library(dplyr)
+
+district_check <- mn_trad %>%
+  group_by(district_ID, `District Name`) %>%
+  summarise(
+    n_schools_in_file = n(),
+    n_elem_reported   = first(n_elem_schools_in_district),
+    diff              = n_schools_in_file - n_elem_reported,
+    .groups = "drop"
+  ) %>%
+  arrange(diff)
+
+# How many districts match vs mismatch?
+table(district_check$diff)
+
+# Districts missing the most schools (diff most negative)
+head(district_check, 15)
+
+# Districts with extra schools (diff positive) — usually should be none
+tail(district_check, 15)
+```
+
+```{r model_A_complete_case}
+mA_cc <- lm(
+  Per_Proficient ~ Single_Elem_Dist + Total_Enroll + Per_FRPL + Per_Stu_of_Colr,
+  data = mn_trad
+)
+
+summary(mA_cc)
+
+# How many rows were used?
+nobs(mA_cc)
+
+```
+```{r center_frpl}
+mn_trad <- mn_trad %>%
+  mutate(Per_FRPL_c = Per_FRPL - mean(Per_FRPL, na.rm = TRUE))
+```
+
+```{r interaction_frpl_single}
+m_main <- lm(
+  Per_Proficient ~ Single_Elem_Dist + Per_FRPL_c + Total_Enroll + Per_Stu_of_Colr,
+  data = mn_trad
+)
+
+m_int <- lm(
+  Per_Proficient ~ Single_Elem_Dist * Per_FRPL_c + Total_Enroll + Per_Stu_of_Colr,
+  data = mn_trad
+)
+
+summary(m_int)
+anova(m_main, m_int)
+```
+```{r predicted_proficiency_levels}
+# Choose FRPL levels to compare (edit these if you want)
+frpl_levels <- c(20, 40, 60, 80)
+
+# Center them using the same mean you used in Per_FRPL_c
+frpl_mean <- mean(mn_trad$Per_FRPL, na.rm = TRUE)
+frpl_c_levels <- frpl_levels - frpl_mean
+
+# Hold other covariates constant at their means
+enroll_mean <- mean(mn_trad$Total_Enroll, na.rm = TRUE)
+soc_mean    <- mean(mn_trad$Per_Stu_of_Colr, na.rm = TRUE)
+
+# Build prediction grid
+pred_grid <- data.frame(
+  Per_FRPL = frpl_levels,
+  Per_FRPL_c = frpl_c_levels,
+  Total_Enroll = enroll_mean,
+  Per_Stu_of_Colr = soc_mean,
+  Single_Elem_Dist = rep(c(0, 1), each = length(frpl_levels))
+)
+
+# Predict proficiency
+pred_grid$Pred_Proficient <- predict(m_int, newdata = pred_grid)
+
+# Make a cleaner display
+pred_table <- pred_grid[, c("Single_Elem_Dist", "Per_FRPL", "Pred_Proficient")]
+pred_table <- pred_table[order(pred_table$Per_FRPL, pred_table$Single_Elem_Dist), ]
+
+pred_table
+```
+```{r predicted_gaps}
+library(tidyr)
+library(dplyr)
+
+pred_table %>%
+  tidyr::pivot_wider(names_from = Single_Elem_Dist, values_from = Pred_Proficient) %>%
+  rename(multi = `0`, single = `1`) %>%
+  mutate(single_minus_multi = single - multi)
+```
+
+
+```{r plot_interaction}
+# Create two fitted lines: Single_Elem_Dist = 0 and 1
+frpl_seq <- seq(min(mn_trad$Per_FRPL, na.rm=TRUE), max(mn_trad$Per_FRPL, na.rm=TRUE), length.out=100)
+frpl_c_seq <- frpl_seq - mean(mn_trad$Per_FRPL, na.rm=TRUE)
+
+new0 <- data.frame(Single_Elem_Dist=0, Per_FRPL_c=frpl_c_seq,
+                   Total_Enroll=mean(mn_trad$Total_Enroll, na.rm=TRUE),
+                   Per_Stu_of_Colr=mean(mn_trad$Per_Stu_of_Colr, na.rm=TRUE))
+new1 <- new0; new1$Single_Elem_Dist <- 1
+
+y0 <- predict(m_int, newdata=new0)
+y1 <- predict(m_int, newdata=new1)
+
+# Base scatter (all schools)
+plot(mn_trad$Per_FRPL, mn_trad$Per_Proficient,
+     pch = 21, bg = "white", col = "gray40",
+     xlab="Per_FRPL", ylab="Per_Proficient",
+     main="Interaction: FRPL x Single_Elem_Dist")
+
+# Highlight single-elementary schools (filled yellow)
+idx_single <- mn_trad$Single_Elem_Dist == 1
+points(mn_trad$Per_FRPL[idx_single], mn_trad$Per_Proficient[idx_single],
+       pch = 21, bg = "yellow", col = "black")
+
+lines(frpl_seq, y0, col = "blue", lwd = 2)
+lines(frpl_seq, y1, col = "red",  lwd = 2)
+
+legend("topright",
+       legend = c("Multi-elem line", "Single-elem line", "Single-elem schools"),
+       col = c("blue", "red", "black"),
+       lty = c(1, 1, NA),
+       pch = c(NA, NA, 21),
+       pt.bg = c(NA, NA, "yellow"),
+       lwd = c(2, 2, NA),
+       bty = "n")
+
+```
+```{r diagnostics_interaction}
+par(mfrow=c(2,2))
+plot(m_int)
+par(mfrow=c(1,1))
+```
+
+```{r chunk_4}
+mn_trad[c(745, 746, 213), c("district_ID","District Name","school_ID","School Name",
+                            "Per_Proficient","Per_FRPL","Single_Elem_Dist",
+                            "Total_Enroll","Per_Stu_of_Colr")]
+```
+
+```{r sensitivity_influence}
+# Get top influential rows by Cook's distance
+cd <- cooks.distance(m_int)
+top_idx <- as.numeric(names(sort(cd, decreasing = TRUE)[1:5]))
+
+# Refit without top 2 and top 5
+m_int_drop2 <- lm(
+  Per_Proficient ~ Single_Elem_Dist * Per_FRPL_c + Total_Enroll + Per_Stu_of_Colr,
+  data = mn_trad[-top_idx[1:2], ]
+)
+
+m_int_drop5 <- lm(
+  Per_Proficient ~ Single_Elem_Dist * Per_FRPL_c + Total_Enroll + Per_Stu_of_Colr,
+  data = mn_trad[-top_idx, ]
+)
+
+# Compare the interaction term across models
+rbind(
+  full = coef(summary(m_int))["Single_Elem_Dist:Per_FRPL_c", ],
+  drop2 = coef(summary(m_int_drop2))["Single_Elem_Dist:Per_FRPL_c", ],
+  drop5 = coef(summary(m_int_drop5))["Single_Elem_Dist:Per_FRPL_c", ]
+)
+```
+
+```{r chunk_5}
+library(sandwich)
+library(lmtest)
+
+V_cl <- vcovCL(m_int, cluster = mn_trad$district_ID)
+coeftest(m_int, vcov. = V_cl)
+```
+
+```{r within_between_soc}
+library(dplyr)
+
+district_means <- mn_trad %>%
+  group_by(district_ID) %>%
+  summarise(
+    mean_soc  = mean(Per_Stu_of_Colr, na.rm = TRUE),
+    sd_within = sd(Per_Stu_of_Colr, na.rm = TRUE),
+    n_schools = n(),
+    .groups = "drop"
+  )
+
+summary(district_means$sd_within)
+summary(district_means$mean_soc)
+summary(district_means$n_schools)
+```
+
+```{r chunk_6}
+m_int_plus_cc <- lm(
+  Per_Proficient ~ Single_Elem_Dist * Per_FRPL_c + Total_Enroll + Per_Stu_of_Colr + Per_ELL + Per_SpEd,
+  data = mn_trad
+)
+
+V_cl2 <- vcovCL(m_int_plus_cc, cluster = mn_trad$district_ID)
+coeftest(m_int_plus_cc, vcov. = V_cl2)
+
+
+nobs(m_int)         # from the earlier interaction model
+nobs(m_int_plus_cc) # current model
+
+```
+
+```{r make_mn_trad_imp}
+library(dplyr)
+
+mn_trad_imp <- mn_trad %>%
+  group_by(district_ID) %>%
+  mutate(
+    FRPL_miss = ifelse(is.na(Per_FRPL), 1, 0),
+    ELL_miss  = ifelse(is.na(Per_ELL), 1, 0),
+    SpEd_miss = ifelse(is.na(Per_SpEd), 1, 0),
+
+    Per_FRPL_imp = ifelse(is.na(Per_FRPL), mean(Per_FRPL, na.rm = TRUE), Per_FRPL),
+    Per_ELL_imp  = ifelse(is.na(Per_ELL),  mean(Per_ELL,  na.rm = TRUE),  Per_ELL),
+    Per_SpEd_imp = ifelse(is.na(Per_SpEd), mean(Per_SpEd, na.rm = TRUE), Per_SpEd)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    Per_FRPL_imp = ifelse(is.nan(Per_FRPL_imp), mean(Per_FRPL, na.rm=TRUE), Per_FRPL_imp),
+    Per_ELL_imp  = ifelse(is.nan(Per_ELL_imp),  mean(Per_ELL,  na.rm=TRUE),  Per_ELL_imp),
+    Per_SpEd_imp = ifelse(is.nan(Per_SpEd_imp), mean(Per_SpEd, na.rm=TRUE), Per_SpEd_imp),
+
+    # re-center using the imputed FRPL
+    Per_FRPL_c_imp = Per_FRPL_imp - mean(Per_FRPL_imp, na.rm = TRUE)
+  )
+
+nrow(mn_trad_imp)
+colSums(is.na(mn_trad_imp[, c("Per_FRPL_imp","Per_ELL_imp","Per_SpEd_imp")]))
+```
+
+```{r interaction_imputed_clustered}
+m_int_imp <- lm(
+  Per_Proficient ~ Single_Elem_Dist * Per_FRPL_c_imp + Total_Enroll + Per_Stu_of_Colr +
+    Per_ELL_imp + Per_SpEd_imp + FRPL_miss + ELL_miss + SpEd_miss,
+  data = mn_trad_imp
+)
+
+V_imp <- vcovCL(m_int_imp, cluster = mn_trad_imp$district_ID)
+coeftest(m_int_imp, vcov. = V_imp)
+nobs(m_int_imp)
+```
+
+```{r check_count_transform}
+# Distribution: raw count
+summary(mn_trad_imp$n_elem_schools_in_district)
+table(mn_trad_imp$n_elem_schools_in_district)
+
+# Visual: raw count vs proficiency
+plot(mn_trad_imp$n_elem_schools_in_district, mn_trad_imp$Per_Proficient,
+     xlab="n_elem_schools_in_district", ylab="Per_Proficient",
+     main="Proficiency vs number of elementary schools")
+
+# Compare with log scale (diminishing returns view)
+mn_trad_imp$log_n_elem <- log(mn_trad_imp$n_elem_schools_in_district)
+
+plot(mn_trad_imp$log_n_elem, mn_trad_imp$Per_Proficient,
+     xlab="log(n_elem_schools_in_district)", ylab="Per_Proficient",
+     main="Proficiency vs log(number of elementary schools)")
+```
+```{r model_count_main_cluster}
+m_count_main <- lm(
+  Per_Proficient ~ log_n_elem + Per_FRPL_c_imp + Total_Enroll + Per_Stu_of_Colr +
+    Per_ELL_imp + Per_SpEd_imp + FRPL_miss + ELL_miss + SpEd_miss,
+  data = mn_trad_imp
+)
+
+V_count_main <- vcovCL(m_count_main, cluster = mn_trad_imp$district_ID)
+coeftest(m_count_main, vcov. = V_count_main)
+```
+
+```{r model_count_interaction_cluster}
+m_count_int <- lm(
+  Per_Proficient ~ log_n_elem * Per_FRPL_c_imp + Total_Enroll + Per_Stu_of_Colr +
+    Per_ELL_imp + Per_SpEd_imp + FRPL_miss + ELL_miss + SpEd_miss,
+  data = mn_trad_imp
+)
+
+V_count_int <- vcovCL(m_count_int, cluster = mn_trad_imp$district_ID)
+coeftest(m_count_int, vcov. = V_count_int)
+anova(m_count_main, m_count_int)
+```
+```{r make_n_elem_bins}
+library(dplyr)
+
+mn_trad_imp <- mn_trad_imp %>%
+  mutate(
+    n_elem_bin = case_when(
+      n_elem_schools_in_district == 1 ~ "1",
+      n_elem_schools_in_district %in% 2:3 ~ "2-3",
+      n_elem_schools_in_district %in% 4:6 ~ "4-6",
+      n_elem_schools_in_district %in% 7:10 ~ "7-10",
+      n_elem_schools_in_district >= 11 ~ "11+",
+      TRUE ~ NA_character_
+    ),
+    n_elem_bin = factor(n_elem_bin, levels = c("1","2-3","4-6","7-10","11+"))
+  )
+
+table(mn_trad_imp$n_elem_bin, useNA="ifany")
+```
+```{r model_bins_interaction_cluster}
+library(sandwich)
+library(lmtest)
+
+m_bin_int <- lm(
+  Per_Proficient ~ n_elem_bin * Per_FRPL_c_imp + Total_Enroll + Per_Stu_of_Colr +
+    Per_ELL_imp + Per_SpEd_imp + FRPL_miss + ELL_miss + SpEd_miss,
+  data = mn_trad_imp
+)
+
+V_bin <- vcovCL(m_bin_int, cluster = mn_trad_imp$district_ID)
+coeftest(m_bin_int, vcov. = V_bin)
+```
+
+```{r slopes_by_bin}
+b <- coef(m_bin_int)
+```
+
+
+```{r slopes_by_bin_v2}
+# baseline FRPL slope in bin "1"
+slope_1 <- b["Per_FRPL_c_imp"]
+
+# add the interaction adjustments for other bins (if a bin isn't present, it will be NA)
+slope_23  <- slope_1 + b["n_elem_bin2-3:Per_FRPL_c_imp"]
+slope_46  <- slope_1 + b["n_elem_bin4-6:Per_FRPL_c_imp"]
+slope_710 <- slope_1 + b["n_elem_bin7-10:Per_FRPL_c_imp"]
+slope_11p <- slope_1 + b["n_elem_bin11+:Per_FRPL_c_imp"]
+
+data.frame(
+  bin = c("1","2-3","4-6","7-10","11+"),
+  FRPL_slope = c(slope_1, slope_23, slope_46, slope_710, slope_11p)
+)
+```
+
+```{r chunk_7}
+mn_trad_imp <- mn_trad_imp %>%
+  mutate(
+    small_1to3 = ifelse(n_elem_schools_in_district <= 3, 1, 0)
+  )
+
+m_small_int <- lm(
+  Per_Proficient ~ small_1to3 * Per_FRPL_c_imp + Total_Enroll + Per_Stu_of_Colr +
+    Per_ELL_imp + Per_SpEd_imp + FRPL_miss + ELL_miss + SpEd_miss,
+  data = mn_trad_imp
+)
+
+V_small <- vcovCL(m_small_int, cluster = mn_trad_imp$district_ID)
+coeftest(m_small_int, vcov. = V_small)
+
+anova(m_small_int, m_bin_int)
+AIC(m_small_int, m_bin_int)
+BIC(m_small_int, m_bin_int)
+```
+
+```{r predictions_small_vs_mediumplus}
+# FRPL levels to compare
+frpl_levels <- c(20, 40, 60, 80)
+
+# Convert to the centered scale used in the model
+frpl_mean_imp <- mean(mn_trad_imp$Per_FRPL_imp, na.rm = TRUE)
+frpl_c_levels <- frpl_levels - frpl_mean_imp
+
+# Hold other covariates constant at their means (imputed versions)
+enroll_mean <- mean(mn_trad_imp$Total_Enroll, na.rm = TRUE)
+soc_mean    <- mean(mn_trad_imp$Per_Stu_of_Colr, na.rm = TRUE)
+ell_mean    <- mean(mn_trad_imp$Per_ELL_imp, na.rm = TRUE)
+sped_mean   <- mean(mn_trad_imp$Per_SpEd_imp, na.rm = TRUE)
+
+# Build prediction grid
+pred_grid <- expand.grid(
+  small_1to3 = c(0, 1),
+  Per_FRPL_c_imp = frpl_c_levels
+)
+
+pred_grid$Per_FRPL <- frpl_levels[match(pred_grid$Per_FRPL_c_imp, frpl_c_levels)]
+pred_grid$Total_Enroll    <- enroll_mean
+pred_grid$Per_Stu_of_Colr <- soc_mean
+pred_grid$Per_ELL_imp     <- ell_mean
+pred_grid$Per_SpEd_imp    <- sped_mean
+
+# For flags, set to 0 to represent "not missing" typical case
+pred_grid$FRPL_miss <- 0
+pred_grid$ELL_miss  <- 0
+pred_grid$SpEd_miss <- 0
+
+# Predicted proficiency
+pred_grid$Pred_Proficient <- predict(m_small_int, newdata = pred_grid)
+
+# Table view (easy to read)
+pred_table <- pred_grid[order(pred_grid$Per_FRPL, pred_grid$small_1to3),
+                        c("small_1to3","Per_FRPL","Pred_Proficient")]
+pred_table
+
+# Plot
+plot(pred_grid$Per_FRPL[pred_grid$small_1to3==0],
+     pred_grid$Pred_Proficient[pred_grid$small_1to3==0],
+     type="l", lwd=2, col="blue",
+     xlab="Per_FRPL", ylab="Predicted Per_Proficient",
+     main="Predicted proficiency by FRPL: small (1–3) vs medium+ (4+) districts")
+
+lines(pred_grid$Per_FRPL[pred_grid$small_1to3==1],
+      pred_grid$Pred_Proficient[pred_grid$small_1to3==1],
+      lwd=2, col="red")
+
+legend("topright",
+       legend=c("Medium+ districts (4+)", "Small districts (1–3)"),
+       col=c("blue","red"), lty=1, lwd=2, bty="n")
+```
+
+```{r chunk_8}
+c(RSS = sum(resid(m_small_int)^2),
+  neg2logL = -2 * as.numeric(logLik(m_small_int)))
+
+c(RSS = sum(resid(m_bin_int)^2),
+  neg2logL = -2 * as.numeric(logLik(m_bin_int)))
+```
+
+```{r chunk_9}
+fit_table <- data.frame(
+  Model = c("Binary: small (1–3) vs 4+ (interaction)",
+            "Binned: 1, 2–3, 4–6, 7–10, 11+ (interaction)"),
+  n = c(nobs(m_small_int), nobs(m_bin_int)),
+  k = c(length(coef(m_small_int)), length(coef(m_bin_int))),
+  RSS = c(sum(resid(m_small_int)^2), sum(resid(m_bin_int)^2)),
+  # neg2logL = c(-2 * as.numeric(logLik(m_small_int)),
+  #             -2 * as.numeric(logLik(m_bin_int))),
+  AIC = c(AIC(m_small_int), AIC(m_bin_int)),
+  BIC = c(BIC(m_small_int), BIC(m_bin_int))
+)
+
+fit_table
+```
+```{r chunk_10}
+data.frame(
+  Model = c("Binary", "Binned"),
+  RSS = c(sum(resid(m_small_int)^2), sum(resid(m_bin_int)^2)),
+  AIC = c(AIC(m_small_int), AIC(m_bin_int)),
+  BIC = c(BIC(m_small_int), BIC(m_bin_int))
+)
+```
+
+```{r make_mn_all_imp}
+library(dplyr)
+
+mn_all_imp <- mn_all %>%
+  group_by(district_ID) %>%
+  mutate(
+    FRPL_miss = ifelse(is.na(Per_FRPL), 1, 0),
+    ELL_miss  = ifelse(is.na(Per_ELL), 1, 0),
+    SpEd_miss = ifelse(is.na(Per_SpEd), 1, 0),
+
+    Per_FRPL_imp = ifelse(is.na(Per_FRPL), mean(Per_FRPL, na.rm=TRUE), Per_FRPL),
+    Per_ELL_imp  = ifelse(is.na(Per_ELL),  mean(Per_ELL,  na.rm=TRUE),  Per_ELL),
+    Per_SpEd_imp = ifelse(is.na(Per_SpEd), mean(Per_SpEd, na.rm=TRUE), Per_SpEd)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    Per_FRPL_imp = ifelse(is.nan(Per_FRPL_imp), mean(Per_FRPL, na.rm=TRUE), Per_FRPL_imp),
+    Per_ELL_imp  = ifelse(is.nan(Per_ELL_imp),  mean(Per_ELL,  na.rm=TRUE),  Per_ELL_imp),
+    Per_SpEd_imp = ifelse(is.nan(Per_SpEd_imp), mean(Per_SpEd, na.rm=TRUE), Per_SpEd_imp),
+
+    Per_FRPL_c_imp = Per_FRPL_imp - mean(Per_FRPL_imp, na.rm=TRUE),
+
+    # threshold indicator (small = 1–3 elementaries)
+    small_1to3 = ifelse(n_elem_schools_in_district <= 3, 1, 0)
+  )
+
+nrow(mn_all_imp)
+table(mn_all_imp$is_charter)
+```
+```{r model_all_charter_control}
+library(sandwich)
+library(lmtest)
+
+m_all_small <- lm(
+  Per_Proficient ~ small_1to3 * Per_FRPL_c_imp + is_charter +
+    Total_Enroll + Per_Stu_of_Colr + Per_ELL_imp + Per_SpEd_imp +
+    FRPL_miss + ELL_miss + SpEd_miss,
+  data = mn_all_imp
+)
+
+V_all <- vcovCL(m_all_small, cluster = mn_all_imp$district_ID)
+coeftest(m_all_small, vcov. = V_all)
+```
+
+```{r model_all_threeway}
+m_all_3way <- lm(
+  Per_Proficient ~ small_1to3 * Per_FRPL_c_imp * is_charter +
+    Total_Enroll + Per_Stu_of_Colr + Per_ELL_imp + Per_SpEd_imp +
+    FRPL_miss + ELL_miss + SpEd_miss,
+  data = mn_all_imp
+)
+
+V_3way <- vcovCL(m_all_3way, cluster = mn_all_imp$district_ID)
+coeftest(m_all_3way, vcov. = V_3way)
+```
+
+
+```{r chunk_11}
+m_3way <- lm(
+  Per_Proficient ~ small_1to3 * Per_FRPL_c_imp * is_charter +
+    Total_Enroll + Per_Stu_of_Colr + Per_ELL_imp + Per_SpEd_imp +
+    FRPL_miss + ELL_miss + SpEd_miss,
+  data = mn_all_imp
+)
+
+V_3way <- vcovCL(m_3way, cluster = mn_all_imp$district_ID)
+coeftest(m_3way, vcov. = V_3way)
+```
+
+```{r chunk_12}
+table(mn_all_imp$small_1to3, mn_all_imp$is_charter)
+
+alias(m_3way)
+```
+```{r charter_vs_trad_within_small}
+library(dplyr)
+library(sandwich)
+library(lmtest)
+
+d_small <- mn_all_imp %>% filter(small_1to3 == 1)
+
+m_small_charter_int <- lm(
+  Per_Proficient ~ Per_FRPL_c_imp * is_charter +
+    Total_Enroll + Per_Stu_of_Colr + Per_ELL_imp + Per_SpEd_imp +
+    FRPL_miss + ELL_miss + SpEd_miss,
+  data = d_small
+)
+
+V_small <- vcovCL(m_small_charter_int, cluster = d_small$district_ID)
+coeftest(m_small_charter_int, vcov. = V_small)
+```
+FINAL MODEL ALL SCHOOLS
+```{r final_model_all_schools, message=FALSE, warning=FALSE}
+library(dplyr)
+library(sandwich)
+library(lmtest)
+
+# Build the all-schools imputed analysis dataset (if not already created)
+mn_all_imp <- mn_all %>%
+  group_by(district_ID) %>%
+  mutate(
+    FRPL_miss = ifelse(is.na(Per_FRPL), 1, 0),
+    ELL_miss  = ifelse(is.na(Per_ELL), 1, 0),
+    SpEd_miss = ifelse(is.na(Per_SpEd), 1, 0),
+
+    Per_FRPL_imp = ifelse(is.na(Per_FRPL), mean(Per_FRPL, na.rm=TRUE), Per_FRPL),
+    Per_ELL_imp  = ifelse(is.na(Per_ELL),  mean(Per_ELL,  na.rm=TRUE),  Per_ELL),
+    Per_SpEd_imp = ifelse(is.na(Per_SpEd), mean(Per_SpEd, na.rm=TRUE), Per_SpEd)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    Per_FRPL_imp = ifelse(is.nan(Per_FRPL_imp), mean(Per_FRPL, na.rm=TRUE), Per_FRPL_imp),
+    Per_ELL_imp  = ifelse(is.nan(Per_ELL_imp),  mean(Per_ELL,  na.rm=TRUE),  Per_ELL_imp),
+    Per_SpEd_imp = ifelse(is.nan(Per_SpEd_imp), mean(Per_SpEd, na.rm=TRUE), Per_SpEd_imp),
+
+    Per_FRPL_c_imp = Per_FRPL_imp - mean(Per_FRPL_imp, na.rm=TRUE),
+
+    # Small vs medium+ district threshold: 1–3 vs 4+
+    small_1to3 = ifelse(n_elem_schools_in_district <= 3, 1, 0)
+  )
+
+# Final model (all schools) + clustered SEs
+m_all_small <- lm(
+  Per_Proficient ~ small_1to3 * Per_FRPL_c_imp + is_charter +
+    Total_Enroll + Per_Stu_of_Colr + Per_ELL_imp + Per_SpEd_imp +
+    FRPL_miss + ELL_miss + SpEd_miss,
+  data = mn_all_imp
+)
+
+V_all <- vcovCL(m_all_small, cluster = mn_all_imp$district_ID)
+ct_all <- coeftest(m_all_small, vcov. = V_all)
+
+ct_all
+nobs(m_all_small)
+```
+
+```{r predictions_all_schools_small_vs_mediumplus, message=FALSE, warning=FALSE}
+# FRPL levels to compare
+frpl_levels <- c(20, 40, 60, 80)
+
+# Center using the same mean used in mn_all_imp
+frpl_mean_imp <- mean(mn_all_imp$Per_FRPL_imp, na.rm = TRUE)
+frpl_c_levels <- frpl_levels - frpl_mean_imp
+
+# Hold other covariates constant at their means (imputed versions)
+enroll_mean <- mean(mn_all_imp$Total_Enroll, na.rm = TRUE)
+soc_mean    <- mean(mn_all_imp$Per_Stu_of_Colr, na.rm = TRUE)
+ell_mean    <- mean(mn_all_imp$Per_ELL_imp, na.rm = TRUE)
+sped_mean   <- mean(mn_all_imp$Per_SpEd_imp, na.rm = TRUE)
+
+# Build prediction grid (small vs medium+, at each FRPL level)
+pred_grid <- expand.grid(
+  small_1to3 = c(0, 1),
+  Per_FRPL_c_imp = frpl_c_levels
+)
+
+pred_grid$Per_FRPL <- frpl_levels[match(pred_grid$Per_FRPL_c_imp, frpl_c_levels)]
+pred_grid$is_charter      <- 0  # hold at traditional for the main comparison
+pred_grid$Total_Enroll    <- enroll_mean
+pred_grid$Per_Stu_of_Colr <- soc_mean
+pred_grid$Per_ELL_imp     <- ell_mean
+pred_grid$Per_SpEd_imp    <- sped_mean
+pred_grid$FRPL_miss <- 0
+pred_grid$ELL_miss  <- 0
+pred_grid$SpEd_miss <- 0
+
+pred_grid$Pred_Proficient <- predict(m_all_small, newdata = pred_grid)
+
+# Table (easy to copy into narrative)
+pred_table <- pred_grid[order(pred_grid$Per_FRPL, pred_grid$small_1to3),
+                        c("small_1to3","Per_FRPL","Pred_Proficient")]
+pred_table
+
+# Add the gap at each FRPL: (small - medium+)
+gap_table <- reshape(pred_table, idvar="Per_FRPL", timevar="small_1to3", direction="wide")
+names(gap_table) <- gsub("Pred_Proficient\\.", "Pred_", names(gap_table))
+gap_table$small_minus_mediumplus <- gap_table$Pred_1 - gap_table$Pred_0
+gap_table
+
+# Plot: two lines
+plot(gap_table$Per_FRPL, gap_table$Pred_0, type="l", lwd=2, col="blue",
+     xlab="Per_FRPL", ylab="Predicted Per_Proficient",
+     main="Predicted proficiency by FRPL: small (1–3) vs medium+ (4+) districts\n(holding charter=0, other covariates at means)")
+lines(gap_table$Per_FRPL, gap_table$Pred_1, lwd=2, col="red")
+legend("topright",
+       legend=c("Medium+ districts (4+)", "Small districts (1–3)"),
+       col=c("blue","red"), lty=1, lwd=2, bty="n")
+```
+Modeling summary
+```{r modeling summary}
+# Outcome and unit: School-level MCA reading percent proficient (All Grades / All students), with schools as the unit of analysis.
+# 
+# Initial sample and outcome filtering: Started with 908 elementary schools; excluded 6 schools with missing/suppressed Per_Proficient → 902 schools available for analysis.
+# 
+# Key structure variables: District elementary-school count (n_elem_schools_in_district) and derived indicators: Single_Elem_Dist (1 vs 2+) and the final threshold small_1to3 (1–3 vs 4+).
+# 
+# Missing covariates: Small amounts of missingness in FRPL/ELL/SpEd; missingness was more common in smaller schools and associated with higher proficiency.
+# 
+# Missing-data handling: Used district-mean imputation for FRPL/ELL/SpEd plus missingness flags (FRPL_miss, ELL_miss, SpEd_miss) to retain observations and document uncertainty.
+# 
+# Baseline models: In traditional schools, Single_Elem_Dist alone was not a significant level shift after controlling for core covariates.
+# 
+# Theory-driven interaction: Tested whether poverty effects differ by district structure. The interaction between poverty (FRPL) and district size/structure was consistently supported.
+# 
+# Diagnostics: Residual vs fitted, Q–Q, scale-location, and leverage plots showed no major violations; a small number of influential observations were checked and results were robust to their removal.
+# 
+# Dependence / clustering: Because schools are nested within districts, inference uses district-clustered standard errors. Key interaction results remained statistically significant with clustered SEs.
+# 
+# Threshold identification: A binned district-size model showed FRPL slopes were similar for 1 vs 2–3 elementaries, while districts with 4+ elementaries had significantly steeper poverty penalties. This motivated the parsimonious threshold model small_1to3 (1–3 vs 4+).
+# 
+# Model selection: AIC/BIC and nested-model tests indicated that the multi-bin specification did not improve fit enough to justify added parameters; the binary threshold model was preferred for parsimony and interpretability.
+# 
+# Charter robustness: Re-estimated the final model including charter schools (with a charter indicator). The small_1to3 × FRPL interaction remained statistically significant. Within small districts, the FRPL slope did not differ significantly between charter and non-charter schools.
+```
+
+
+```{r vif_final_model, message=FALSE, warning=FALSE}
+library(car)
+vif(m_all_small)
+```
+
+```{r blockwise_frpl_then_soc}
+# Block 1: FRPL only
+b1 <- lm(Per_Proficient ~ Per_FRPL_c_imp, data = mn_all_imp)
+
+# Block 2: add "other controls" (excluding Per_Stu_of_Colr)
+b2 <- update(b1, . ~ . + is_charter + Total_Enroll + Per_ELL_imp + Per_SpEd_imp +
+              FRPL_miss + ELL_miss + SpEd_miss)
+
+# Block 3: add Per_Stu_of_Colr (its unique contribution after FRPL + other controls)
+b3 <- update(b2, . ~ . + Per_Stu_of_Colr)
+
+# Block 4: add district-size threshold (main effect)
+b4 <- update(b3, . ~ . + small_1to3)
+
+# Block 5: add the key interaction (final)
+b5 <- update(b4, . ~ . + small_1to3:Per_FRPL_c_imp)
+
+# Summarize incremental R^2
+tbl <- data.frame(
+  Block = c("b1: FRPL",
+            "b2: + charter, enroll, ELL, SpEd, missing flags",
+            "b3: + % students of color",
+            "b4: + small_1to3",
+            "b5: + small_1to3 × FRPL"),
+  k = c(length(coef(b1)), length(coef(b2)), length(coef(b3)), length(coef(b4)), length(coef(b5))),
+  R2 = c(summary(b1)$r.squared, summary(b2)$r.squared, summary(b3)$r.squared, summary(b4)$r.squared, summary(b5)$r.squared),
+  Adj_R2 = c(summary(b1)$adj.r.squared, summary(b2)$adj.r.squared, summary(b3)$adj.r.squared, summary(b4)$adj.r.squared, summary(b5)$adj.r.squared),
+  n = c(nobs(b1), nobs(b2), nobs(b3), nobs(b4), nobs(b5))
+)
+tbl$Delta_R2 <- c(NA, diff(tbl$R2))
+tbl
+
+# Sequential (Type I) model comparison (note: these are not cluster-robust tests)
+anova(b1, b2, b3, b4, b5)
+```
+Flipping Per_FRPL and Per_Stu_of_Colr
+```{r blockwise_soc_then_frpl}
+# Block 1: % students of color only
+c1 <- lm(Per_Proficient ~ Per_Stu_of_Colr, data = mn_all_imp)
+
+# Block 2: add "other controls" (excluding FRPL)
+c2 <- update(c1, . ~ . + is_charter + Total_Enroll + Per_ELL_imp + Per_SpEd_imp +
+              FRPL_miss + ELL_miss + SpEd_miss)
+
+# Block 3: add FRPL (its unique contribution after % students of color + other controls)
+c3 <- update(c2, . ~ . + Per_FRPL_c_imp)
+
+# Block 4: add district-size threshold (main effect)
+c4 <- update(c3, . ~ . + small_1to3)
+
+# Block 5: add the key interaction (final)
+c5 <- update(c4, . ~ . + small_1to3:Per_FRPL_c_imp)
+
+# Summarize incremental R^2
+tbl2 <- data.frame(
+  Block = c("c1: % students of color",
+            "c2: + charter, enroll, ELL, SpEd, missing flags",
+            "c3: + FRPL",
+            "c4: + small_1to3",
+            "c5: + small_1to3 × FRPL"),
+  k = c(length(coef(c1)), length(coef(c2)), length(coef(c3)), length(coef(c4)), length(coef(c5))),
+  R2 = c(summary(c1)$r.squared, summary(c2)$r.squared, summary(c3)$r.squared, summary(c4)$r.squared, summary(c5)$r.squared),
+  Adj_R2 = c(summary(c1)$adj.r.squared, summary(c2)$adj.r.squared, summary(c3)$adj.r.squared, summary(c4)$adj.r.squared, summary(c5)$adj.r.squared),
+  n = c(nobs(c1), nobs(c2), nobs(c3), nobs(c4), nobs(c5))
+)
+tbl2$Delta_R2 <- c(NA, diff(tbl2$R2))
+tbl2
+
+# Sequential comparisons (OLS-style; not cluster-robust tests)
+anova(c1, c2, c3, c4, c5)
+```
+
+
+```{r final_diagnostics_plots, message=FALSE, warning=FALSE}
+par(mfrow=c(2,2))
+plot(m_all_small)
+par(mfrow=c(1,1))
+```
+
+```{r corr_key_covariates, message=FALSE, warning=FALSE}
+vars <- mn_all_imp[, c("Per_Proficient","Per_FRPL_imp","Per_Stu_of_Colr","Per_ELL_imp","Per_SpEd_imp","Total_Enroll")]
+cor(vars, use="pairwise.complete.obs")
+```
+```{r blockwise_final_order_frpl_controls_composition_structure}
+# Block 1: FRPL
+m1 <- lm(Per_Proficient ~ Per_FRPL_c_imp, data = mn_all_imp)
+
+# Block 2: other controls (excluding ELL and % students of color for now)
+m2 <- update(m1, . ~ . + is_charter + Total_Enroll + Per_SpEd_imp +
+              FRPL_miss + ELL_miss + SpEd_miss)
+
+# Block 3: composition block (add both together)
+m3 <- update(m2, . ~ . + Per_ELL_imp + Per_Stu_of_Colr)
+
+# Block 4: district structure main effect
+m4 <- update(m3, . ~ . + small_1to3)
+
+# Block 5: key interaction
+m5 <- update(m4, . ~ . + small_1to3:Per_FRPL_c_imp)
+
+# Summarize incremental R^2
+tbl_final <- data.frame(
+  Block = c("m1: FRPL",
+            "m2: + charter, enroll, SpEd, missing flags",
+            "m3: + composition block (ELL + % students of color)",
+            "m4: + small_1to3",
+            "m5: + small_1to3 × FRPL"),
+  k = c(length(coef(m1)), length(coef(m2)), length(coef(m3)), length(coef(m4)), length(coef(m5))),
+  R2 = c(summary(m1)$r.squared, summary(m2)$r.squared, summary(m3)$r.squared, summary(m4)$r.squared, summary(m5)$r.squared),
+  Adj_R2 = c(summary(m1)$adj.r.squared, summary(m2)$adj.r.squared, summary(m3)$adj.r.squared, summary(m4)$adj.r.squared, summary(m5)$adj.r.squared),
+  n = c(nobs(m1), nobs(m2), nobs(m3), nobs(m4), nobs(m5))
+)
+tbl_final$Delta_R2 <- c(NA, diff(tbl_final$R2))
+tbl_final
+
+# Sequential comparisons (OLS-style; interpret as variance-explained, not cluster-robust inference)
+anova(m1, m2, m3, m4, m5)
+```
+
+```{r inspect_flagged_points}
+# Which rows are most influential in the FINAL model?
+cd <- cooks.distance(m_all_small)
+top_idx <- as.numeric(names(sort(cd, decreasing = TRUE)[1:10]))
+
+mn_all_imp[top_idx, c("district_ID","District Name","school_ID","School Name",
+                      "Per_Proficient","Per_FRPL_imp","small_1to3","is_charter",
+                      "Total_Enroll","Per_Stu_of_Colr","Per_ELL_imp","Per_SpEd_imp")]
+```
+
+```{r sensitivity_final_model}
+cd <- cooks.distance(m_all_small)
+top_idx <- as.numeric(names(sort(cd, decreasing = TRUE)[1:5]))
+
+m_drop2 <- update(m_all_small, data = mn_all_imp[-top_idx[1:2], ])
+m_drop5 <- update(m_all_small, data = mn_all_imp[-top_idx, ])
+
+# clustered SE comparison for the key interaction
+V_full  <- vcovCL(m_all_small, cluster = mn_all_imp$district_ID)
+V_d2    <- vcovCL(m_drop2,     cluster = mn_all_imp$district_ID[-top_idx[1:2]])
+V_d5    <- vcovCL(m_drop5,     cluster = mn_all_imp$district_ID[-top_idx])
+
+rbind(
+  full  = coeftest(m_all_small, vcov. = V_full )["small_1to3:Per_FRPL_c_imp", ],
+  drop2 = coeftest(m_drop2,     vcov. = V_d2   )["small_1to3:Per_FRPL_c_imp", ],
+  drop5 = coeftest(m_drop5,     vcov. = V_d5   )["small_1to3:Per_FRPL_c_imp", ]
+)
+```
+```{r}
+rmd <- readLines("mn_reading_analysis.Rmd")
+labs <- sub("^```\\{r\\s*([^,} ]+).*$", "\\1", grep("^```\\{r", rmd, value = TRUE))
+unique(labs[duplicated(labs)])
+```
+```{r save_canonical_dataset}
+# Save canonical plotting dataset (run once, safe to re-run)
+saveRDS(mn_all_imp, "output/mn_all_imp.rds")
+
+# quick confirmation
+file.exists("output/mn_all_imp.rds")
+```
+
